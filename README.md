@@ -24,8 +24,14 @@ git clone https://github.com/dspitech/aws-cleanup-checker-Students.git && cd aws
 ## Utilisation
 
 ```bash
-./aws-cleanup-check.sh              # scan complet
-./aws-cleanup-check.sh eu-west-3    # une région
+# Lancer un scan complet (toutes régions + S3 + coûts)
+./aws-cleanup-check.sh
+
+# Cibler une seule région (plus rapide)
+./aws-cleanup-check.sh eu-west-3
+
+# Rediriger le résultat dans un fichier
+./aws-cleanup-check.sh 2>&1 | tee cleanup-$(date +%F).log
 ```
 
 ## Exemple de sortie
