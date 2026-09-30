@@ -18,7 +18,7 @@ Ces ressources sont facturées même après suppression du service principal.
 ## Installation
 
 ```bash
-git clone https://github.com/dspitech/aws-cleanup-checker-Students.git && cd aws-cleanup-checker && chmod +x aws-cleanup-check.sh && ./aws-cleanup-check.sh
+git clone https://github.com/dspitech/aws-cleanup-checker-Students.git && cd aws-cleanup-checker-Students && chmod +x aws-cleanup-check.sh && ./aws-cleanup-check.sh
 ```
 
 ## Utilisation
