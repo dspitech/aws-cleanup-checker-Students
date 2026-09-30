@@ -28,7 +28,11 @@ Ces ressources sont facturées même après suppression du service principal.
 
 ```bash
 git clone https://github.com/dspitech/aws-cleanup-checker-Students.git && cd aws-cleanup-checker-Students && chmod +x aws-cleanup-check.sh && ./aws-cleanup-check.sh
+```
 
+### Autres commandes
+
+```bash
 # Audit avec export JSON (sans suppression)
 ./aws-cleanup-check.sh --scan-only --format json --output audit.json
 
