@@ -15,6 +15,15 @@ Après avoir supprimé une instance RDS, EC2 ou un bucket S3, il reste souvent :
 
 Ces ressources sont facturées même après suppression du service principal.
 
+## Fonctionnalités
+
+- Scan automatique de 13 services AWS sur toutes les régions
+- Tableau récapitulatif clair
+- Menu interactif de suppression ciblée
+- Suppression par ressource, par région, multi-régions, ou globale
+- Mode `--dry-run` pour tester sans rien casser
+- Mode `--scan-only` pour intégration CI/CD
+
 ## Installation
 
 ```bash
@@ -23,24 +32,22 @@ git clone https://github.com/dspitech/aws-cleanup-checker-Students.git && cd aws
 
 ## Utilisation
 
-```bash
-# Lancer un scan complet (toutes régions + S3 + coûts)
-./aws-cleanup-check.sh
+| Commande | Description |
+|---|---|
+| `./aws-cleanup-check.sh` | Scan + menu interactif |
+| `./aws-cleanup-check.sh --region eu-west-3` | Cible une région |
+| `./aws-cleanup-check.sh --scan-only` | Audit sans suppression |
+| `./aws-cleanup-check.sh --dry-run` | Simule les suppressions |
+| `./aws-cleanup-check.sh --yes` | Non-interactif 
 
-# Cibler une seule région (plus rapide)
-./aws-cleanup-check.sh eu-west-3
-
-# Rediriger le résultat dans un fichier
-./aws-cleanup-check.sh 2>&1 | tee cleanup-$(date +%F).log
-```
 
 ## Exemple de sortie
 
 ```
-✔ Aucune ressource RDS
-⚠ Snapshots RDS  : wordpressdeploy-snapshot-wpdatabase-xxx
-⚠ EIP non assoc. : 15.xxx.xxx.xxx
-✔ Aucun bucket S3
+- Aucune ressource RDS
+- Snapshots RDS  : wordpressdeploy-snapshot-wpdatabase-xxx
+- EIP non assoc. : 15.xxx.xxx.xxx
+- Aucun bucket S3
 ```
 
 ## Prérequis
@@ -49,6 +56,6 @@ git clone https://github.com/dspitech/aws-cleanup-checker-Students.git && cd aws
 - Identifiants configurés (`aws configure`, SSO, rôle)
 - Policy IAM fournie dans `iam-policy.json`
 
-## 📄 License
+## License
 
 MIT
