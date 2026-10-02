@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 #
-# aws-cleanup-check.sh  —  v2.1
+# aws-cleanup-check.sh  -  v2.2
 # ---------------------------------
 # Scanner + nettoyeur AWS tout-en-un.
 #
 #   - Scanne toutes les régions (ou une seule)
 #   - Détecte : RDS, EC2, EBS, EIP, AMI, S3, ELB, Lambda, DynamoDB,
 #     SNS, SQS, ECR, ECS, EKS, Secrets Manager,
-#     NAT Gateway, CloudWatch Logs
+#     NAT Gateway, CloudWatch Logs,
+#     CloudFront, API Gateway, Cognito, SES, ElastiCache, OpenSearch,
+#     EFS, Kinesis, Step Functions, Route53, KMS, EventBridge,
+#     Auto Scaling, CloudFormation
 #   - Tableau récapitulatif + estimation du coût mensuel
 #   - Menu interactif : suppression ciblée par région et/ou par ressource
 #   - Whitelist par tag ou pattern
@@ -29,7 +32,7 @@
 set -uo pipefail
 shopt -s nullglob
 
-VERSION="2.1"
+VERSION="2.2"
 DRY_RUN=0
 SCAN_ONLY=0
 AUTO_YES=0
@@ -107,15 +110,12 @@ fi
 declare -a FOUND=()
 
 register() {
-    # $1=region $2=service $3=type $4=id $5=details $6=cost
     FOUND+=("$1|$2|$3|$4|$5|${6:-0}")
 }
 
 # ---------- Filtres whitelist ----------
 is_excluded() {
-    # $1 = identifiant de la ressource
     local id="$1"
-
     if [[ -n "$EXCLUDE_PATTERN" ]]; then
         # shellcheck disable=SC2053
         if [[ "$id" == $EXCLUDE_PATTERN ]]; then
@@ -126,8 +126,6 @@ is_excluded() {
 }
 
 check_tag_exclusion() {
-    # $1=region $2=resource_arn_or_id $3=type
-    # Vérifie si la ressource porte le tag EXCLUDE_TAG (clé=valeur)
     [[ -z "$EXCLUDE_TAG" ]] && return 1
     local region="$1" id="$2" type="$3"
     local key="${EXCLUDE_TAG%%=*}"
@@ -154,9 +152,6 @@ check_tag_exclusion() {
             local tags
             tags=$(aws s3api get-bucket-tagging --bucket "$id" 2>/dev/null || true)
             [[ -n "$tags" ]] && echo "$tags" | grep -q "\"$key\"" && echo "$tags" | grep -q "\"$val\"" && return 0
-            ;;
-        *)
-            # Par défaut : pas de vérification de tag pour ce type
             ;;
     esac
     return 1
@@ -188,13 +183,9 @@ scan_rds() {
         return
     fi
 
-    # Instances RDS (db.t3.micro = ~15 $/mois si running, stockage en plus)
     if [[ -n "$instances" ]]; then
-        while IFS= read -r line; do
-            [[ -z "$line" || "$line" == "None" ]] && continue
-            local id st
-            id=$(echo "$line" | awk '{print $1}')
-            st=$(echo "$line" | awk '{print $2}')
+        while IFS=$'\t' read -r id st; do
+            [[ -z "$id" || "$id" == "None" ]] && continue
             if is_excluded "$id" || check_tag_exclusion "$r" "$id" "rds:instance"; then
                 log_info "RDS exclu (filtre) : $id"
                 continue
@@ -204,7 +195,6 @@ scan_rds() {
         done <<< "$instances"
     fi
 
-    # Snapshots RDS (~0.095 $/Go/mois)
     if [[ -n "$snaps" ]]; then
         while IFS= read -r s; do
             [[ -z "$s" || "$s" == "None" ]] && continue
@@ -316,7 +306,7 @@ scan_nat_gateway() {
 }
 
 # ============================================================
-#  SCAN — CloudWatch Logs (rétention infinie)
+#  SCAN — CloudWatch Logs
 # ============================================================
 scan_cloudwatch_logs() {
     local r="$1"
@@ -449,6 +439,334 @@ scan_serverless() {
 }
 
 # ============================================================
+#  SCAN — API Gateway
+# ============================================================
+scan_apigateway() {
+    local r="$1"
+    log_section "API Gateway — $r"
+    local found=0
+
+    local rest
+    rest=$(run_aws "$r" apigateway get-rest-apis --query "items[].{Id:id,Name:name}")
+    if [[ -n "$rest" && "$rest" != "None" ]]; then
+        while IFS=$'\t' read -r id name; do
+            [[ -z "$id" || "$id" == "None" ]] && continue
+            is_excluded "$id" && continue
+            log_warn "REST API     : $id ($name)"
+            register "$r" "apigateway" "rest" "$id" "$name" "0.00"
+            found=1
+        done <<< "$rest"
+    fi
+
+    local v2
+    v2=$(run_aws "$r" apigatewayv2 get-apis --query "Items[].{Id:ApiId,Name:Name}")
+    if [[ -n "$v2" && "$v2" != "None" ]]; then
+        while IFS=$'\t' read -r id name; do
+            [[ -z "$id" || "$id" == "None" ]] && continue
+            is_excluded "$id" && continue
+            log_warn "HTTP/WS API  : $id ($name)"
+            register "$r" "apigatewayv2" "api" "$id" "$name" "0.00"
+            found=1
+        done <<< "$v2"
+    fi
+
+    [[ "$found" -eq 0 ]] && log_ok "Aucune API Gateway"
+}
+
+# ============================================================
+#  SCAN — Cognito
+# ============================================================
+scan_cognito() {
+    local r="$1"
+    log_section "Cognito — $r"
+    local found=0
+
+    local pools
+    pools=$(run_aws "$r" cognito-idp list-user-pools --max-results 60 \
+        --query "UserPools[].{Id:Id,Name:Name}")
+    if [[ -n "$pools" && "$pools" != "None" ]]; then
+        while IFS=$'\t' read -r id name; do
+            [[ -z "$id" || "$id" == "None" ]] && continue
+            is_excluded "$id" && continue
+            log_warn "Cognito Pool : $id ($name)"
+            register "$r" "cognito-idp" "user-pool" "$id" "$name" "0.00"
+            found=1
+        done <<< "$pools"
+    fi
+
+    local idpools
+    idpools=$(run_aws "$r" cognito-identity list-identity-pools --max-results 60 \
+        --query "IdentityPools[].{Id:IdentityPoolId,Name:IdentityPoolName}")
+    if [[ -n "$idpools" && "$idpools" != "None" ]]; then
+        while IFS=$'\t' read -r id name; do
+            [[ -z "$id" || "$id" == "None" ]] && continue
+            is_excluded "$id" && continue
+            log_warn "Cognito IdP  : $id ($name)"
+            register "$r" "cognito-identity" "identity-pool" "$id" "$name" "0.00"
+            found=1
+        done <<< "$idpools"
+    fi
+
+    [[ "$found" -eq 0 ]] && log_ok "Aucun Cognito User/Identity Pool"
+}
+
+# ============================================================
+#  SCAN — SES
+# ============================================================
+scan_ses() {
+    local r="$1"
+    log_section "SES — $r"
+
+    local ids
+    ids=$(run_aws "$r" ses list-identities --query "Identities[]")
+    if [[ -z "$ids" || "$ids" == "None" ]]; then
+        log_ok "Aucune identité SES"
+        return
+    fi
+    for id in $ids; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        is_excluded "$id" && continue
+        log_warn "SES identity : $id"
+        register "$r" "ses" "identity" "$id" "" "0.00"
+    done
+}
+
+# ============================================================
+#  SCAN — ElastiCache
+# ============================================================
+scan_elasticache() {
+    local r="$1"
+    log_section "ElastiCache — $r"
+    local found=0
+
+    local clusters
+    clusters=$(run_aws "$r" elasticache describe-cache-clusters \
+        --query "CacheClusters[].{Id:CacheClusterId,Engine:Engine,Status:CacheClusterStatus}")
+    if [[ -n "$clusters" && "$clusters" != "None" ]]; then
+        while IFS=$'\t' read -r id engine status; do
+            [[ -z "$id" || "$id" == "None" ]] && continue
+            is_excluded "$id" && continue
+            log_warn "ElastiCache  : $id ($engine, $status) — ~15 \$/mois mini"
+            register "$r" "elasticache" "cluster" "$id" "$engine/$status" "15.00"
+            found=1
+        done <<< "$clusters"
+    fi
+
+    local rgs
+    rgs=$(run_aws "$r" elasticache describe-replication-groups \
+        --query "ReplicationGroups[].ReplicationGroupId")
+    for id in $rgs; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        is_excluded "$id" && continue
+        log_warn "Replication group : $id"
+        register "$r" "elasticache" "replication-group" "$id" "" "15.00"
+        found=1
+    done
+
+    [[ "$found" -eq 0 ]] && log_ok "Aucun cluster ElastiCache"
+}
+
+# ============================================================
+#  SCAN — OpenSearch
+# ============================================================
+scan_opensearch() {
+    local r="$1"
+    log_section "OpenSearch — $r"
+
+    local domains
+    domains=$(run_aws "$r" opensearch list-domain-names \
+        --query "DomainNames[].{Name:DomainName,Engine:EngineType}")
+
+    if [[ -z "$domains" || "$domains" == "None" ]]; then
+        log_ok "Aucun domaine OpenSearch"
+        return
+    fi
+
+    while IFS=$'\t' read -r name engine; do
+        [[ -z "$name" || "$name" == "None" ]] && continue
+        is_excluded "$name" && continue
+        log_warn "OpenSearch   : $name ($engine) — ~30 \$/mois mini"
+        register "$r" "opensearch" "domain" "$name" "$engine" "30.00"
+    done <<< "$domains"
+}
+
+# ============================================================
+#  SCAN — EFS
+# ============================================================
+scan_efs() {
+    local r="$1"
+    log_section "EFS — $r"
+
+    local fs
+    fs=$(run_aws "$r" efs describe-file-systems \
+        --query "FileSystems[].{Id:FileSystemId,Size:SizeInBytes.Value,State:LifeCycleState}")
+
+    if [[ -z "$fs" || "$fs" == "None" ]]; then
+        log_ok "Aucun système de fichiers EFS"
+        return
+    fi
+
+    while IFS=$'\t' read -r id size state; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        is_excluded "$id" && continue
+        local cost
+        cost=$(awk -v s="${size:-0}" 'BEGIN{printf "%.2f", s/1024/1024/1024*0.30}')
+        log_warn "EFS          : $id ($state) — $size octets (~$cost \$/mois)"
+        register "$r" "efs" "file-system" "$id" "$size bytes" "$cost"
+    done <<< "$fs"
+}
+
+# ============================================================
+#  SCAN — Kinesis
+# ============================================================
+scan_kinesis() {
+    local r="$1"
+    log_section "Kinesis — $r"
+
+    local streams
+    streams=$(run_aws "$r" kinesis list-streams --query "StreamNames[]")
+    if [[ -z "$streams" || "$streams" == "None" ]]; then
+        log_ok "Aucun stream Kinesis"
+        return
+    fi
+    for id in $streams; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        is_excluded "$id" && continue
+        log_warn "Kinesis stream : $id (~11 \$/mois mini)"
+        register "$r" "kinesis" "stream" "$id" "" "11.00"
+    done
+}
+
+# ============================================================
+#  SCAN — Step Functions
+# ============================================================
+scan_stepfunctions() {
+    local r="$1"
+    log_section "Step Functions — $r"
+
+    local machines
+    machines=$(run_aws "$r" stepfunctions list-state-machines \
+        --query "stateMachines[].{Name:name,Arn:stateMachineArn}")
+
+    if [[ -z "$machines" || "$machines" == "None" ]]; then
+        log_ok "Aucune state machine"
+        return
+    fi
+
+    while IFS=$'\t' read -r name arn; do
+        [[ -z "$name" || "$name" == "None" ]] && continue
+        is_excluded "$name" && continue
+        log_warn "Step Function : $name"
+        register "$r" "stepfunctions" "state-machine" "$arn" "$name" "0.00"
+    done <<< "$machines"
+}
+
+# ============================================================
+#  SCAN — KMS
+# ============================================================
+scan_kms() {
+    local r="$1"
+    log_section "KMS — $r"
+
+    local keys
+    keys=$(run_aws "$r" kms list-keys --query "Keys[].KeyId")
+    if [[ -z "$keys" || "$keys" == "None" ]]; then
+        log_ok "Aucune clé KMS"
+        return
+    fi
+
+    for id in $keys; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        local manager
+        manager=$(run_aws "$r" kms describe-key --key-id "$id" --query "KeyMetadata.KeyManager")
+        [[ "$manager" == "AWS" ]] && continue
+        is_excluded "$id" && continue
+        log_warn "KMS key      : $id (customer-managed) — ~1 \$/mois"
+        register "$r" "kms" "key" "$id" "" "1.00"
+    done
+}
+
+# ============================================================
+#  SCAN — EventBridge
+# ============================================================
+scan_eventbridge() {
+    local r="$1"
+    log_section "EventBridge — $r"
+    local found=0
+
+    local buses
+    buses=$(run_aws "$r" events list-event-buses --query "EventBuses[].Name")
+    for id in $buses; do
+        [[ -z "$id" || "$id" == "None" || "$id" == "default" ]] && continue
+        is_excluded "$id" && continue
+        log_warn "EventBridge  : $id"
+        register "$r" "events" "event-bus" "$id" "" "0.00"
+        found=1
+    done
+
+    local rules
+    rules=$(run_aws "$r" events list-rules --query "Rules[].Name")
+    for id in $rules; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        is_excluded "$id" && continue
+        log_warn "EB rule      : $id"
+        register "$r" "events" "rule" "$id" "" "0.00"
+        found=1
+    done
+
+    [[ "$found" -eq 0 ]] && log_ok "Aucun EventBridge custom"
+}
+
+# ============================================================
+#  SCAN — Auto Scaling Groups
+# ============================================================
+scan_asg() {
+    local r="$1"
+    log_section "Auto Scaling — $r"
+
+    local groups
+    groups=$(run_aws "$r" autoscaling describe-auto-scaling-groups \
+        --query "AutoScalingGroups[].{Name:AutoScalingGroupName,Min:MinSize,Max:MaxSize,Desired:DesiredCapacity}")
+
+    if [[ -z "$groups" || "$groups" == "None" ]]; then
+        log_ok "Aucun Auto Scaling Group"
+        return
+    fi
+
+    while IFS=$'\t' read -r name min max desired; do
+        [[ -z "$name" || "$name" == "None" ]] && continue
+        is_excluded "$name" && continue
+        log_warn "ASG          : $name (min=$min max=$max desired=$desired)"
+        register "$r" "autoscaling" "group" "$name" "$desired instances" "0.00"
+    done <<< "$groups"
+}
+
+# ============================================================
+#  SCAN — CloudFormation
+# ============================================================
+scan_cloudformation() {
+    local r="$1"
+    log_section "CloudFormation — $r"
+
+    local stacks
+    stacks=$(run_aws "$r" cloudformation list-stacks \
+        --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE ROLLBACK_COMPLETE \
+        --query "StackSummaries[].{Name:StackName,Status:StackStatus}")
+
+    if [[ -z "$stacks" || "$stacks" == "None" ]]; then
+        log_ok "Aucune stack CloudFormation active"
+        return
+    fi
+
+    while IFS=$'\t' read -r name status; do
+        [[ -z "$name" || "$name" == "None" ]] && continue
+        is_excluded "$name" && continue
+        log_warn "CFN stack    : $name ($status)"
+        register "$r" "cloudformation" "stack" "$name" "$status" "0.00"
+    done <<< "$stacks"
+}
+
+# ============================================================
 #  SCAN — S3 (global)
 # ============================================================
 scan_s3() {
@@ -480,12 +798,63 @@ scan_s3() {
                 log_info "Bucket exclu (filtre) : $b"
                 continue
             fi
-            # Coût approximatif S3 Standard : ~0.023 $/Go/mois
             cost=$(awk -v s="$size" 'BEGIN{printf "%.2f", s/1024/1024/1024*0.023}')
             log_warn "Bucket $b [$region] — $count objets, $size octets (~$cost \$/mois)"
             register "$region" "s3" "bucket" "$b" "$count objects / $size bytes" "$cost"
         fi
     done
+}
+
+# ============================================================
+#  SCAN — CloudFront (global)
+# ============================================================
+scan_cloudfront() {
+    log_section "CloudFront (global)"
+    local dists
+    dists=$(aws cloudfront list-distributions \
+        --query "DistributionList.Items[].{Id:Id,Status:Status,Domain:DomainName,Enabled:Enabled}" \
+        --output text 2>/dev/null || true)
+
+    if [[ -z "$dists" || "$dists" == "None" ]]; then
+        log_ok "Aucune distribution CloudFront"
+        return
+    fi
+
+    while IFS=$'\t' read -r id status domain enabled; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        is_excluded "$id" && { log_info "CloudFront exclu : $id"; continue; }
+        if [[ "$enabled" == "True" ]]; then
+            log_warn "CloudFront   : $id ($status) — $domain"
+            register "global" "cloudfront" "distribution" "$id" "$status/$domain" "1.00"
+        else
+            log_info "CloudFront désactivée : $id ($status)"
+        fi
+    done <<< "$dists"
+}
+
+# ============================================================
+#  SCAN — Route53 (global)
+# ============================================================
+scan_route53() {
+    log_section "Route53 (global)"
+
+    local zones
+    zones=$(aws route53 list-hosted-zones \
+        --query "HostedZones[].{Id:Id,Name:Name,Private:Config.PrivateZone}" \
+        --output text 2>/dev/null || true)
+
+    if [[ -z "$zones" || "$zones" == "None" ]]; then
+        log_ok "Aucune hosted zone Route53"
+        return
+    fi
+
+    while IFS=$'\t' read -r id name private; do
+        [[ -z "$id" || "$id" == "None" ]] && continue
+        local short_id="${id##*/}"
+        is_excluded "$short_id" && continue
+        log_warn "Route53 zone : $short_id ($name) — ~0.50 \$/mois"
+        register "global" "route53" "hosted-zone" "$short_id" "$name" "0.50"
+    done <<< "$zones"
 }
 
 # ============================================================
@@ -501,15 +870,15 @@ print_summary_table() {
         return
     fi
 
-    printf "${BOLD}%-4s %-14s %-14s %-14s %-45s %-10s${RESET}\n" \
+    printf "${BOLD}%-4s %-14s %-16s %-16s %-45s %-10s${RESET}\n" \
         "#" "RÉGION" "SERVICE" "TYPE" "IDENTIFIANT" "COÛT"
-    printf "${DIM}%s${RESET}\n" "────────────────────────────────────────────────────────────────────────────────────────"
+    printf "${DIM}%s${RESET}\n" "------------------------------"
 
     local idx=1
     local total_cost=0
     for entry in "${FOUND[@]}"; do
         IFS='|' read -r region service type id details cost <<< "$entry"
-        printf "%-4s %-14s %-14s %-14s %-45s %-8s \$/mois\n" \
+        printf "%-4s %-14s %-16s %-16s %-45s %-8s \$/mois\n" \
             "[$idx]" "$region" "$service" "$type" "$id" "$cost"
         total_cost=$(awk -v a="$total_cost" -v b="$cost" 'BEGIN{print a+b}')
         idx=$((idx + 1))
@@ -630,10 +999,12 @@ delete_resource() {
 
     local -a cmd=()
     case "$service:$type" in
+        # - RDS -
         rds:instance)         cmd=(aws rds delete-db-instance --db-instance-identifier "$id" --skip-final-snapshot --delete-automated-backups --region "$region") ;;
         rds:snapshot)         cmd=(aws rds delete-db-snapshot --db-snapshot-identifier "$id" --region "$region") ;;
         rds:cluster-snapshot) cmd=(aws rds delete-db-cluster-snapshot --db-cluster-snapshot-identifier "$id" --region "$region") ;;
 
+        # - EC2 / EBS / EIP -
         ec2:instance)         cmd=(aws ec2 terminate-instances --instance-ids "$id" --region "$region") ;;
         ec2:volume)           cmd=(aws ec2 delete-volume --volume-id "$id" --region "$region") ;;
         ec2:snapshot)         cmd=(aws ec2 delete-snapshot --snapshot-id "$id" --region "$region") ;;
@@ -641,9 +1012,11 @@ delete_resource() {
         ec2:eip)              cmd=(aws ec2 release-address --allocation-id "$id" --region "$region") ;;
         ec2:nat-gateway)      cmd=(aws ec2 delete-nat-gateway --nat-gateway-id "$id" --region "$region") ;;
 
+        # - ELB -
         elb:classic)          cmd=(aws elb delete-load-balancer --load-balancer-name "$id" --region "$region") ;;
         elbv2:*)              cmd=(aws elbv2 delete-load-balancer --load-balancer-arn "$id" --region "$region") ;;
 
+        # - Serverless -
         lambda:function)      cmd=(aws lambda delete-function --function-name "$id" --region "$region") ;;
         dynamodb:table)       cmd=(aws dynamodb delete-table --table-name "$id" --region "$region") ;;
         sns:topic)            cmd=(aws sns delete-topic --topic-arn "$id" --region "$region") ;;
@@ -654,7 +1027,59 @@ delete_resource() {
         secretsmanager:secret) cmd=(aws secretsmanager delete-secret --secret-id "$id" --force-delete-without-recovery --region "$region") ;;
         logs:log-group)       cmd=(aws logs delete-log-group --log-group-name "$id" --region "$region") ;;
 
+        # - S3 -
         s3:bucket)            cmd=(aws s3 rb "s3://$id" --force) ;;
+
+        # - API Gateway -
+        apigateway:rest)      cmd=(aws apigateway delete-rest-api --rest-api-id "$id" --region "$region") ;;
+        apigatewayv2:api)     cmd=(aws apigatewayv2 delete-api --api-id "$id" --region "$region") ;;
+
+        # - Cognito -
+        cognito-idp:user-pool) cmd=(aws cognito-idp delete-user-pool --user-pool-id "$id" --region "$region") ;;
+        cognito-identity:identity-pool) cmd=(aws cognito-identity delete-identity-pool --identity-pool-id "$id" --region "$region") ;;
+
+        # - SES -
+        ses:identity)         cmd=(aws ses delete-identity --identity "$id" --region "$region") ;;
+
+        # - ElastiCache -
+        elasticache:cluster)  cmd=(aws elasticache delete-cache-cluster --cache-cluster-id "$id" --region "$region") ;;
+        elasticache:replication-group) cmd=(aws elasticache delete-replication-group --replication-group-id "$id" --region "$region") ;;
+
+        # - OpenSearch -
+        opensearch:domain)    cmd=(aws opensearch delete-domain --domain-name "$id" --region "$region") ;;
+
+        # - EFS -
+        efs:file-system)      cmd=(aws efs delete-file-system --file-system-id "$id" --region "$region") ;;
+
+        # - Kinesis -
+        kinesis:stream)       cmd=(aws kinesis delete-stream --stream-name "$id" --enforce-consumer-deletion --region "$region") ;;
+
+        # - Step Functions -
+        stepfunctions:state-machine) cmd=(aws stepfunctions delete-state-machine --state-machine-arn "$id" --region "$region") ;;
+
+        # - Route53 -
+        route53:hosted-zone)  cmd=(aws route53 delete-hosted-zone --id "$id") ;;
+
+        # - KMS -
+        kms:key)              cmd=(aws kms schedule-key-deletion --key-id "$id" --pending-window-in-days 7 --region "$region") ;;
+
+        # - EventBridge -
+        events:event-bus)     cmd=(aws events delete-event-bus --name "$id" --region "$region") ;;
+        events:rule)          cmd=(aws events delete-rule --name "$id" --region "$region") ;;
+
+        # - Auto Scaling -
+        autoscaling:group)    cmd=(aws autoscaling delete-auto-scaling-group --auto-scaling-group-name "$id" --force-delete --region "$region") ;;
+
+        # - CloudFormation -
+        cloudformation:stack) cmd=(aws cloudformation delete-stack --stack-name "$id" --region "$region") ;;
+
+        # - CloudFront (nécessite désactivation + attente) -
+        cloudfront:distribution)
+            log_warn "CloudFront nécessite une désactivation manuelle. Commande affichée :"
+            echo -e "${DIM}$ aws cloudfront update-distribution --id $id --if-match <ETAG> --distribution-config '<config avec Enabled=false>'${RESET}"
+            log_info "Puis, après ~15 min : aws cloudfront delete-distribution --id $id --if-match <ETAG>"
+            return 1
+            ;;
 
         *) log_error "Type non supporté : $service:$type"; return 1 ;;
     esac
@@ -825,7 +1250,7 @@ cat <<'BANNER'
   / _ \| | /| / /| |    / __| |___ ___ _ _ _ _ (_)_ _
  | (_) | |/ |/ / | |__ | (__| / _ \ -_) ' \ ' \| | ' \
   \___/|__/|__/  |____| \___|_\___/___|_||_|_||_|_|_||_|
-                       v2.1  •  Scanner + Cleanup
+                       v2.2  •  Scanner + Cleanup
 BANNER
 echo -e "${RESET}"
 
@@ -858,9 +1283,24 @@ for r in "${REGIONS[@]}"; do
     scan_cloudwatch_logs "$r"
     scan_elb "$r"
     scan_serverless "$r"
+    scan_apigateway "$r"
+    scan_cognito "$r"
+    scan_ses "$r"
+    scan_elasticache "$r"
+    scan_opensearch "$r"
+    scan_efs "$r"
+    scan_kinesis "$r"
+    scan_stepfunctions "$r"
+    scan_kms "$r"
+    scan_eventbridge "$r"
+    scan_asg "$r"
+    scan_cloudformation "$r"
 done
 
+# - Global (hors région) -
 scan_s3
+scan_cloudfront
+scan_route53
 scan_costs
 
 print_summary_table
