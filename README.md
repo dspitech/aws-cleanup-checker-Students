@@ -5,7 +5,7 @@
 
 ## Pourquoi ?
 
-Après avoir supprimé une instance RDS, EC2 ou un bucket S3, il reste souvent :
+Après avoir supprimé une instance RDS, EC2 ou un bucket S3 ou autres, il reste souvent :
 - des **snapshots manuels** (RDS, EBS),
 - des **AMI personnelles**,
 - des **IP élastiques non associées**,
