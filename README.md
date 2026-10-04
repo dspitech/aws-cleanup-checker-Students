@@ -1,6 +1,6 @@
 # AWS Cleanup Checker
 
-> Détecte les ressources AWS facturables **oubliées** dans toutes les régions,
+> Ce script étecte les ressources AWS facturables **oubliées** dans toutes les régions,
 > y compris les fameux snapshots RDS qui continuent de coûter après suppression.
 
 ## Pourquoi ?
